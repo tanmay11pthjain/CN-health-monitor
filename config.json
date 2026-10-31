@@ -1,0 +1,23 @@
+{
+    "monitor_ip": "10.0.0.5",
+    "report_port": 5000,
+    "alert_port": 5001,
+
+    "controller_ip": "10.0.0.254",
+    "control_port": 9999,
+
+    "report_every": 1.0,
+    "down_after": 3.0,
+
+    "ack_wait": 0.5,
+    "max_tries": 4,
+
+    "mode": "smart",
+
+    "limits": {
+        "cpu":      {"warn": 75,   "crit": 90},
+        "mem":      {"warn": 80,   "crit": 90},
+        "procs":    {"warn": 300,  "crit": 400},
+        "net_kbps": {"warn": 5000, "crit": 8000}
+    }
+}

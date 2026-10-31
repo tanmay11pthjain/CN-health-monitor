@@ -1,0 +1,2 @@
+# Only the SDN controller needs these. agent.py and monitor.py use plain Python.
+os-ken==3.1.1
