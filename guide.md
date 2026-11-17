@@ -129,10 +129,24 @@ Type these in **Window 2** after `mininet>`, then look at **Window 3**.
 | `fail h4` | turns h4's agent off. After about 3 seconds h4 shows **DOWN**, and the controller replies that it removed h4's rules |
 | `recover h4` | h4 comes back **UP** |
 | `screen` | prints the monitor table once inside this window |
-| `dpctl dump-flows -O OpenFlow13` | shows the rules inside the switch. Look for `tp_dst=5001` with `set_queue:1`. That is the fast lane for alerts |
+| `dpctl dump-flows -O OpenFlow13` | shows the rules inside the switch. Look for `tp_dst=5001` with `set_field:46->ip_dscp`. That marks alerts for the fast lane |
 | `help` | lists all commands |
 
-More commands (`congest`, `flood`, `loss`, `cutlink`) come in Phase 2.
+### Phase 2 commands (hard situations)
+
+| Type this | What happens | What smart mode does |
+|---|---|---|
+| `congest on` | h6 sends 20 Mbit/s of junk to the monitor. The cable is only 10 Mbit/s, so it is a traffic jam | alerts still arrive in about 1 ms (fast lane). After about 4 seconds you see `NET h6 ... SLOWED DOWN to 1.0 Mbit/s` |
+| `congest off` | the jam stops | about 6 seconds later: `speed limit REMOVED` |
+| `flood h3` | h3 sends 300 junk packets per second to the monitor for 20 seconds | after about 1 second: `FLOOD h3 ...` then `BLOCKED h3`. h3 shows DOWN. After 30 seconds the block ends by itself and h3 comes back UP |
+| `loss 10` | 10% of packets on the cables of h1 to h5 get lost. `loss 0` turns it off | alerts are sent again until the monitor says "got it" (ACK), so they still arrive. Look for `[arrived on try 2]` |
+| `cutlink h4` | unplugs the cable of h4 | the controller says `cable ... is DOWN`, then h4 shows DOWN |
+| `fixlink h4` | plugs it back in | h4 comes back UP |
+| `restartmon` | stops the monitor program and starts it again | the agents never stop. The table fills up again in a second |
+
+Try `spike h2` while `congest on` is running, once in simple mode and once in smart mode, and compare the latency of the alerts.
+
+Want to see the switch rules the controller added? Type `dpctl dump-flows -O OpenFlow13` after `congest on` (look for `meter:`) or after `flood h3` (look for `nw_src=10.0.0.3 actions=drop`).
 
 ### Try the simple mode (the normal switch, without the fast lane)
 
@@ -142,7 +156,7 @@ Stop everything (Step 7). In Window 1 start the controller like this instead:
 HMON_MODE=simple ./venv/bin/osken-manager controller.py
 ```
 
-Then do Window 2 and 3 again. The monitor table now says `controller mode: simple`, and `dpctl dump-flows` has no `set_queue:1` rule.
+Then do Window 2 and 3 again. The monitor table now says `controller mode: simple`, and `dpctl dump-flows` has no `set_field:46->ip_dscp` rule. In simple mode nobody slows down h6 or blocks h3.
 
 ---
 
@@ -169,7 +183,7 @@ cd ~/CN
 python3 test_basic.py
 ```
 
-At the end you should see `Ran 11 tests` and `OK`.
+At the end you should see `Ran 33 tests` and `OK`. (If matplotlib is missing it says `OK (skipped=1)`, that is fine too.)
 
 **Test 2: the full system inside Mininet**
 
@@ -181,7 +195,7 @@ sudo mn -c
 sudo python3 topo.py --test
 ```
 
-It builds the network, does everything by itself (ping, spike, fail, recover) and prints:
+It builds the network, does everything by itself (ping, spike, fail, recover, traffic jam, flooding, cut cable, packet loss, monitor restart) and prints:
 
 ```
   [PASS] every host can reach every other host (pingall) (0% lost)
@@ -192,10 +206,53 @@ It builds the network, does everything by itself (ping, spike, fail, recover) an
   [PASS] controller confirms h4 is down
   [PASS] h4 comes back UP after recover
   [PASS] smart mode: alert fast lane rule is in the switch
-  [PASS] reports received with little loss (received 45, lost 0)
+  [PASS] switch port to the monitor has a fast lane and a normal lane
 
-*** 9 of 9 tests passed
+  -- Phase 2 --
+  [PASS] alert from h1 still arrives during the traffic jam
+  [PASS] smart mode: controller slows down the noisy host h6
+  [PASS] smart mode: meter rule for h6 is in the switch
+  [PASS] smart mode: limit on h6 is removed when it is quiet again
+  [PASS] monitor notices that h3 is flooding
+  [PASS] smart mode: controller blocks h3
+  [PASS] smart mode: drop rule for 10.0.0.3 is in the switch
+  [PASS] blocked h3 shows DOWN on the monitor
+  [PASS] cut cable: controller reports it and h4 goes DOWN
+  [PASS] fixed cable: h4 comes back UP
+  [PASS] 20% packet loss (netem): alerts still arrive thanks to resend
+  [PASS] monitor restart: agents keep going and show up again
+  [PASS] smart mode: h3 is let in again after the block time and is UP
+  [PASS] monitor kept working the whole time
+
+*** 23 of 23 tests passed
 ```
+
+It takes about 2 minutes (it waits 30 seconds for the block on h3 to end). In simple mode there are 17 checks, because the smart-only ones are skipped and replaced by `simple mode: controller can't block h3`.
+
+## Step 8b: Run the experiments and draw the graphs (Phase 2)
+
+The experiments start the controller by themselves (first in simple mode, then in smart mode), so **stop the controller in Window 1 first** (Ctrl + C). Then:
+
+```
+cd ~/CN
+sudo mn -c
+sudo python3 experiments.py
+python3 plot.py
+```
+
+`experiments.py` takes about 20 minutes and prints a line for every result. Want it faster? Use `sudo python3 experiments.py --quick` (about 10 minutes). You can also run only some tests, for example `sudo python3 experiments.py --tests jam,flood`.
+
+`plot.py` makes the graphs and a results table in the `results` folder:
+
+| File | What it shows |
+|---|---|
+| `results/1_jam_alert_latency.png` | how long alerts take, with and without a traffic jam |
+| `results/2_failure_detection.png` | how long until a stopped server or a cut cable shows DOWN |
+| `results/3_loss_alerts_delivered.png` | how many alerts arrive at 0, 5, 10, 20% packet loss, with and without resend |
+| `results/4_scale.png` | lost reports, latency and monitor CPU with 4, 10, 20, 50 agents |
+| `results/5_flood.png` | how fast a flooding host is blocked |
+| `results/summary.md` | all the numbers in tables |
+| `results/results.json` | the raw numbers |
 
 ## Step 9: Look at the saved data
 
@@ -210,7 +267,7 @@ Everything the monitor sees is saved in the `logs` folder:
 
 You can open the `.csv` files with LibreOffice Calc (double-click them in the Files app).
 
-Graphs and experiments come in Phase 2.
+The experiments keep the same files for every run in `results/runs/<mode>_<test>/`.
 
 ---
 
@@ -224,7 +281,10 @@ Graphs and experiments come in Phase 2.
 | `The switch could not reach the controller` | same: start the controller in Window 1 first |
 | `failed to create datapath` or the switch never connects | your system has no Open vSwitch kernel module. Use `sudo python3 topo.py --userspace` |
 | table in Window 3 is empty | wait 5 seconds. If still empty, stop everything (Step 7) and start again |
-| `Address already in use` | run `sudo mn -c` and start again |
+| `Address already in use` or `UDP port 5000 is already in use` | an old monitor is still running. Run `sudo mn -c` and start again |
+| `something is already using port 6653` (experiments) | the controller from Window 1 is still running. Press Ctrl + C there, then run the experiments again |
+| `config.json: ...` error | you changed config.json and a value is wrong. The message says which one. Fix it (or get the original file back) |
+| `loss` says `(iptables)` instead of `(netem)` | your system has no netem module. That's fine, iptables loses packets the same way |
 | still not working | restart the virtual machine and start from Step 5 |
 
 ---
@@ -239,3 +299,6 @@ Graphs and experiments come in Phase 2.
 - **Mininet**: a program that makes a fake network inside one computer
 - **Latency**: how long a message takes to arrive
 - **ACK**: a "got it" reply
+- **DSCP**: a small number inside every IP packet that says how urgent it is. 46 means "urgent"
+- **Meter**: a speed limit inside the switch
+- **Flooding**: one host sending far too many packets on purpose

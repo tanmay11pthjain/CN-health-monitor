@@ -6,25 +6,29 @@
 # Alerts must be answered with an ACK. If no ACK comes back, the alert
 # is sent again (wait 0.5s, then 1s, then 2s ...).
 #
+# The agent does NOT mark its own packets as urgent. In smart mode the SDN
+# controller does that in the switch, so a host can't cheat.
+#
 # Usage:  python3 agent.py --name h1
+#         python3 agent.py --name h3 --flood 300 --seconds 20   (bad host test)
 
 import argparse
+import json
 import os
 import queue
 import random
 import signal
 import socket
+import sys
 import threading
 import time
 
-from common import (load_config, make_msg, read_msg, check_level,
-                    REPORT, ALERT, ACK)
-
-# DSCP "EF" (expedited forwarding) = 46. The TOS byte is DSCP shifted left by 2.
-# This marks our alert packets as urgent in the IP header.
-TOS_URGENT = 46 << 2
+from common import (load_config, make_msg, read_msg, check_level, ConfigError,
+                    REPORT, ALERT, ACK, FLOOD)
 
 STATE_DIR = "/tmp/hmon"   # topo.py writes "spike" commands here
+MODES = ("normal", "cpu", "mem", "procs")
+MAX_WAITING_ALERTS = 50   # if the monitor is gone, don't keep alerts forever
 
 
 class FakeServer:
@@ -47,9 +51,10 @@ class FakeServer:
         # "normal", "cpu", "mem" or "procs". Set by the spike / calm commands.
         try:
             with open(os.path.join(STATE_DIR, self.name + ".state")) as f:
-                return f.read().strip() or "normal"
-        except OSError:
+                mode = f.read(32).strip()
+        except (OSError, UnicodeDecodeError):
             return "normal"
+        return mode if mode in MODES else "normal"
 
     def read(self):
         mode = self.mode()
@@ -109,22 +114,19 @@ class Agent:
         self.alert_seq = 0
         self.boot = int(time.time() * 1000)   # tells the monitor if we restarted
         self.levels = {}                        # metric -> last level we alerted
-        self.alert_queue = queue.Queue()
+        self.alert_queue = queue.Queue(maxsize=MAX_WAITING_ALERTS)
         self.running = True
 
-        # socket for normal reports
+        # socket for normal reports, and a separate one for alerts + ACKs
         self.report_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-        # separate socket for alerts, marked as urgent
         self.alert_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            self.alert_sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, TOS_URGENT)
-        except OSError:
-            pass
 
         self.sent_reports = 0
-        self.sent_alerts = 0
-        self.failed_alerts = 0
+        self.made_alerts = 0      # alerts we wanted to send
+        self.sent_alerts = 0      # alerts the monitor ACKed
+        self.failed_alerts = 0    # alerts that got no ACK after all tries
+        self.dropped_alerts = 0   # alerts thrown away because the queue was full
+        self.tries_total = 0
 
     # ---------------- reports ----------------
 
@@ -147,12 +149,26 @@ class Agent:
             old = self.levels.get(metric, "OK")
             if level != old:
                 self.levels[metric] = level
-                self.alert_queue.put({
+                self.made_alerts += 1
+                alert = {
                     "metric": metric,
                     "value": stats[metric],
                     "level": level,
                     "limit": limit["crit"] if level == "CRIT" else limit["warn"],
-                })
+                }
+                try:
+                    self.alert_queue.put_nowait(alert)
+                except queue.Full:
+                    # monitor unreachable for a long time: drop the oldest alert
+                    try:
+                        self.alert_queue.get_nowait()
+                        self.dropped_alerts += 1
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.alert_queue.put_nowait(alert)
+                    except queue.Full:
+                        self.dropped_alerts += 1
 
     # ---------------- alerts ----------------
 
@@ -172,9 +188,12 @@ class Agent:
         first_sent = time.time()
 
         for attempt in range(1, self.cfg["max_tries"] + 1):
+            if not self.running and attempt > 1:
+                break
             # keep the first send time so the monitor measures the real delay
             data = make_msg(ALERT, self.name, seq, boot=self.boot, tries=attempt,
                             first_sent=first_sent, **alert)
+            self.tries_total += 1
             try:
                 self.alert_sock.sendto(data, self.alert_addr)
             except OSError as e:
@@ -203,6 +222,9 @@ class Agent:
                 data, _ = self.alert_sock.recvfrom(2048)
             except socket.timeout:
                 return False
+            except ConnectionRefusedError:
+                # "port unreachable" from the monitor host: keep waiting
+                continue
             except OSError:
                 return False
             msg = read_msg(data)
@@ -224,6 +246,8 @@ class Agent:
         while self.running:
             self.send_report()
             sent += 1
+            if sent % 5 == 0:
+                self.save_stats()
             if count and sent >= count:
                 break
             next_time += every
@@ -238,11 +262,51 @@ class Agent:
         while not self.alert_queue.empty() and time.time() < end:
             time.sleep(0.1)
         self.running = False
-        t.join(timeout=5)
+        t.join(timeout=10)
+        self.save_stats()
         self.report_sock.close()
         self.alert_sock.close()
         log(self.name, "stopped. reports=%d alerts=%d failed_alerts=%d"
             % (self.sent_reports, self.sent_alerts, self.failed_alerts))
+
+    def save_stats(self):
+        """Write our counters to /tmp/hmon/<name>.stats (the experiments read it)."""
+        stats = {"node": self.name, "time": time.time(), "boot": self.boot,
+                 "reports": self.sent_reports, "alerts_made": self.made_alerts,
+                 "alerts_acked": self.sent_alerts, "alerts_failed": self.failed_alerts,
+                 "alerts_dropped": self.dropped_alerts, "tries": self.tries_total}
+        try:
+            path = os.path.join(STATE_DIR, self.name + ".stats")
+            with open(path + ".tmp", "w") as f:
+                json.dump(stats, f)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+
+
+def flood(name, monitor_ip, port, pps, seconds):
+    """Bad host test: send far too many packets to the monitor."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    pad = "x" * 900
+    gap = 1.0 / pps
+    end = time.time() + seconds
+    next_time = time.time()
+    sent = 0
+    log(name, "FLOODING %s:%d with %d packets/s for %d s" % (monitor_ip, port, pps, seconds))
+    while time.time() < end:
+        try:
+            sock.sendto(make_msg(FLOOD, name, sent, pad=pad), (monitor_ip, port))
+            sent += 1
+        except OSError:
+            pass          # blocked, or the network is down
+        next_time += gap
+        pause = next_time - time.time()
+        if pause > 0:
+            time.sleep(pause)
+        elif pause < -1:
+            next_time = time.time()
+    sock.close()
+    log(name, "flood finished, %d packets sent" % sent)
 
 
 QUIET = False
@@ -262,11 +326,28 @@ def main():
     p.add_argument("--report-port", type=int, default=None)
     p.add_argument("--alert-port", type=int, default=None)
     p.add_argument("--count", type=int, default=0, help="stop after N reports (0 = forever)")
+    p.add_argument("--flood", type=int, default=0, metavar="PPS",
+                   help="bad host test: flood the monitor with PPS packets per second")
+    p.add_argument("--seconds", type=int, default=20, help="how long to flood")
     args = p.parse_args()
 
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as e:
+        print("ERROR: %s" % e, file=sys.stderr)
+        sys.exit(2)
+    if args.count < 0 or args.flood < 0 or args.seconds <= 0:
+        print("ERROR: --count, --flood and --seconds can't be negative", file=sys.stderr)
+        sys.exit(2)
+
+    monitor_ip = args.monitor or cfg["monitor_ip"]
+    if args.flood:
+        flood(args.name, monitor_ip, args.report_port or cfg["report_port"],
+              args.flood, args.seconds)
+        return
+
     agent = Agent(args.name, cfg,
-                  args.monitor or cfg["monitor_ip"],
+                  monitor_ip,
                   args.report_port or cfg["report_port"],
                   args.alert_port or cfg["alert_port"])
 
@@ -275,7 +356,10 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+    except OSError:
+        pass
     agent.run(args.count)
 
 

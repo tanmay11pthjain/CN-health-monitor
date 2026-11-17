@@ -111,9 +111,9 @@ The controller runs `controller.py` (written with os-ken). It has two modes, so 
 - All packets are treated the same.
 
 **Smart mode (our project):**
-1. **Priority for alerts.** Packets going to port 5001 go into a fast lane (a high-priority queue on the switch). Alerts never wait behind normal traffic.
-2. **Watching traffic.** Every 2 seconds the controller asks the switch how much data each port is sending. If one host sends too much (the noisy host), the controller slows that host down. When it calms down, the limit is removed.
-3. **Blocking a bad host.** If the monitor sees a host sending far too many messages (flooding), it asks the controller to block it. The controller adds a "drop" rule for that host.
+1. **Priority for alerts.** The controller marks packets going to (or coming from) port 5001 as urgent (DSCP 46) inside the switch. Every switch port has two lanes, and the fast lane only takes urgent packets, so alerts never wait behind normal traffic. All other packets get their mark cleared, so no host can cheat.
+2. **Watching traffic.** Every 2 seconds the controller asks the switch how much data each port is sending. If one host sends too much (the noisy host), the controller slows that host down with an OpenFlow meter (a speed limit in the switch). When it calms down, the limit is removed.
+3. **Blocking a bad host.** If the monitor sees a host sending far too many messages (flooding), it asks the controller to block it. The controller adds a "drop" rule for that host. The rule removes itself after 30 seconds and the controller tells the monitor.
 4. **Talking to the monitor.** The monitor sends its requests to the controller as normal UDP messages to port 9999. The switch passes these to the controller. The controller replies and also tells the monitor about network events ("h6 slowed down", "h3 blocked"). This is how our socket program and the SDN network work together.
 
 ---
@@ -133,6 +133,7 @@ CN/
   monitor.py         central monitor, shows table and alerts
   controller.py      SDN controller (simple mode and smart mode)
   topo.py            creates the Mininet network + our extra commands
+  noise.py           the noisy host's traffic jam (plain Python, no iperf needed)
   test_basic.py      quick tests
   experiments.py     runs the tests for the graphs
   plot.py            draws the graphs
@@ -172,6 +173,8 @@ How this matches the marks:
 ---
 
 ## 9. Phase 2 (final submission, D2, 25 marks)
+
+Status: **built and tested.** Results are in the README and in `results/`.
 
 Goal: make the network smart, test hard situations, and measure everything.
 

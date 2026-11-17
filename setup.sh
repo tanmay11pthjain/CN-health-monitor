@@ -14,13 +14,16 @@ fi
 echo "=== 1. Installing Mininet, Open vSwitch and tools (this can take a few minutes) ==="
 $SUDO apt-get update
 $SUDO apt-get install -y mininet openvswitch-switch python3 python3-venv python3-pip \
-    iperf3 iputils-ping iproute2 net-tools ethtool
+    python3-matplotlib iputils-ping iproute2 net-tools ethtool iptables
 
 echo "=== 2. Starting Open vSwitch ==="
 $SUDO systemctl enable --now openvswitch-switch 2>/dev/null || $SUDO service openvswitch-switch start
 if ! $SUDO modprobe openvswitch 2>/dev/null; then
     echo "NOTE: the openvswitch kernel module is missing."
-    echo "      Use 'sudo python3 topo.py --userspace' instead of 'sudo python3 topo.py'."
+    echo "      topo.py and experiments.py will use the userspace switch by themselves."
+fi
+if ! $SUDO modprobe sch_netem 2>/dev/null; then
+    echo "NOTE: tc netem is missing. The 'loss' command will use iptables instead (works the same)."
 fi
 
 echo "=== 3. Installing the SDN controller (os-ken) in a virtual environment ==="

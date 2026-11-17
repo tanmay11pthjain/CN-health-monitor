@@ -14,6 +14,14 @@
 
     "mode": "smart",
 
+    "flood_pps": 50,
+    "block_seconds": 30,
+
+    "watch_every": 2.0,
+    "slow_above_mbps": 4.0,
+    "slow_rate_mbps": 1.0,
+    "calm_below_mbps": 0.5,
+
     "limits": {
         "cpu":      {"warn": 75,   "crit": 90},
         "mem":      {"warn": 80,   "crit": 90},
