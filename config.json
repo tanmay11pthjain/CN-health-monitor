@@ -27,5 +27,19 @@
         "mem":      {"warn": 80,   "crit": 90},
         "procs":    {"warn": 300,  "crit": 400},
         "net_kbps": {"warn": 5000, "crit": 8000}
+    },
+
+    "real": {
+        "monitor_ip": "auto",
+        "discovery_port": 5002,
+        "web_port": 8080,
+        "limits": {
+            "cpu":      {"warn": 75,    "crit": 90},
+            "mem":      {"warn": 80,    "crit": 90},
+            "procs":    {"warn": 450,   "crit": 600},
+            "net_kbps": {"warn": 20000, "crit": 50000},
+            "disk":     {"warn": 90,    "crit": 97},
+            "temp_c":   {"warn": 80,    "crit": 90}
+        }
     }
 }

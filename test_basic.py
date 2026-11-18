@@ -288,7 +288,7 @@ class TestConfig(unittest.TestCase):
         self.bad(lambda c: c.update(mode="fast"), "mode")
         self.bad(lambda c: c["limits"].update(cpu={"warn": 95, "crit": 90}), "warn")
         self.bad(lambda c: c["limits"].pop("mem"), "limits.mem")
-        self.bad(lambda c: c["limits"].update(disk={"warn": 1, "crit": 2}), "unknown")
+        self.bad(lambda c: c["limits"].update(gpu={"warn": 1, "crit": 2}), "unknown")
         self.bad(lambda c: c.update(calm_below_mbps=10), "calm_below_mbps")
 
 
@@ -323,7 +323,7 @@ class TestStrangePackets(unittest.TestCase):
         self.assertFalse(valid_report({"cpu": 1}))
         a = {"time": 1.0, "metric": "cpu", "level": "CRIT", "value": 95, "limit": 90}
         self.assertTrue(valid_alert(a))
-        self.assertFalse(valid_alert(dict(a, metric="disk")))
+        self.assertFalse(valid_alert(dict(a, metric="gpu")))
         self.assertFalse(valid_alert(dict(a, level="PANIC")))
         self.assertFalse(valid_alert(dict(a, value=None)))
         self.assertFalse(valid_alert(dict(a, tries="2")))
@@ -405,7 +405,7 @@ class TestMonitorRobust(MonitorCase):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.bind(("127.0.0.1", 0))
         s.settimeout(1)
-        bad = make_msg(ALERT, "hx", 1, boot=1, metric="disk", level="CRIT", value=1, limit=1)
+        bad = make_msg(ALERT, "hx", 1, boot=1, metric="gpu", level="CRIT", value=1, limit=1)
         s.sendto(bad, ("127.0.0.1", self.aport))
         with self.assertRaises(socket.timeout):
             s.recvfrom(2048)                       # no ACK for a broken alert
@@ -639,6 +639,65 @@ def port_free(port):
         return False
     finally:
         s.close()
+
+
+class TestRealLaptops(unittest.TestCase):
+    """Real mode: psutil numbers, discovery, ping/RTT, web dashboard."""
+
+    def setUp(self):
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            self.skipTest("psutil not installed")
+        self.dir = tempfile.mkdtemp()
+        self.rp, self.ap, self.dp, self.wp = free_port(), free_port(), free_port(), free_port()
+        self.mon = Monitor(CFG, self.dir, "127.0.0.1", self.rp, self.ap, lan=True,
+                           discovery_port=self.dp)
+        self.mon.quiet = True
+        self.mon.start_web(self.wp, "127.0.0.1")
+        threading.Thread(target=self.mon.run, daemon=True).start()
+
+    def tearDown(self):
+        self.mon.running = False
+        time.sleep(0.6)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_metrics_are_real_and_fit_in_one_packet(self):
+        from metrics import RealMachine
+        r = RealMachine().read()
+        for k in common.METRICS:
+            self.assertTrue(common.is_number(r[k]))
+        self.assertTrue(0 <= r["cpu"] <= 100 and 0 < r["mem"] <= 100 and r["procs"] > 0)
+        data = make_msg(REPORT, "x" * 32, 1, **r)
+        self.assertTrue(common.valid_report(read_msg(data)))
+
+    def test_discovery_ping_reports_and_dashboard(self):
+        import urllib.request
+        cfg = common.real_config(CFG)
+        cfg["real"] = dict(cfg["real"], discovery_port=self.dp)
+        found = agent.discover_monitor("t", cfg, targets=["127.0.0.1"])
+        self.assertEqual(found, ("127.0.0.1", self.rp, self.ap))
+        a = agent.Agent("laptop-1", cfg, "127.0.0.1", self.rp, self.ap, real=True)
+        self.assertIsNotNone(a.ping())
+        a.run(count=3)
+        with urllib.request.urlopen("http://127.0.0.1:%d/api/status" % self.wp) as r:
+            st = json.loads(r.read())
+        n = st["nodes"][0]
+        self.assertEqual(n["name"], "laptop-1")
+        self.assertEqual(n["received"], 3)
+        self.assertIn("disk", n["info"])
+        self.assertIn("rtt_ms", n["info"])
+        with urllib.request.urlopen("http://127.0.0.1:%d/" % self.wp) as r:
+            self.assertIn(b"Health Monitor", r.read())
+
+    def test_flood_is_ignored_without_controller(self):
+        agent.flood("bad", "127.0.0.1", self.rp, 300, 2)
+        time.sleep(1)
+        self.assertIn("127.0.0.1", self.mon.app_blocked)
+
+    def test_names_are_cleaned(self):
+        self.assertEqual(common.clean_name("My Laptop (Tanmay)!"), "My-Laptop-Tanmay")
+        self.assertEqual(len(common.clean_name("x" * 100)), 32)
 
 
 if __name__ == "__main__":

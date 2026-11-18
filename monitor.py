@@ -15,12 +15,20 @@
 # the controller to BLOCK it. The controller drops its packets for
 # "block_seconds" and then lets it in again.
 #
-# Usage:  python3 monitor.py
+# LAN mode (real laptops):  python monitor.py --lan
+#   - no SDN controller; a flooding IP is blocked by the monitor itself
+#   - port 5002: answers DISCOVER broadcasts so agents can find us
+#   - live web dashboard on http://<this laptop's IP>:8080
+#
+# Usage:  python3 monitor.py            (Mininet, with the SDN controller)
+#         python monitor.py --lan       (real laptops)
 
 import argparse
 import csv
 import errno
+import http.server
 import json
+from collections import deque
 import os
 import signal
 import socket
@@ -28,9 +36,15 @@ import sys
 import threading
 import time
 
-from common import (HERE, load_config, make_msg, read_msg, check_level, worst_level,
-                    valid_report, valid_alert, ConfigError, METRICS,
-                    REPORT, ALERT, ACK, HELLO, NODE_DOWN, NODE_UP, BLOCK, CTRL_REPLY, NET_EVENT)
+from common import (HERE, load_config, real_config, make_msg, read_msg, check_level,
+                    worst_level, valid_report, valid_alert, is_number, udp_socket, local_ips,
+                    ConfigError, METRICS, REPORT, ALERT, ACK, HELLO, NODE_DOWN, NODE_UP, BLOCK,
+                    CTRL_REPLY, NET_EVENT, PING, DISCOVER, I_AM_MONITOR)
+
+# extra numbers / text a real laptop sends (shown on the dashboard)
+INFO_NUMBERS = ("up_kbps", "down_kbps", "disk", "swap", "temp_c", "battery", "uptime_h",
+                "cores", "mem_gb", "rtt_ms")
+HISTORY = 120        # points kept per node for the dashboard graphs (2 minutes)
 
 MONITOR_NAME = "monitor"
 MAX_NODES = 500      # ignore new names after this (protects memory from junk)
@@ -50,11 +64,18 @@ class Node:
         self.stats = {}
         self.level = "OK"
         self.alerts = 0
+        self.info = {}
+        self.history = deque(maxlen=HISTORY)
 
 
 class Monitor:
     def __init__(self, cfg, logdir, bind_ip="0.0.0.0", report_port=None,
-                 alert_port=None, control_port=None, use_controller=True):
+                 alert_port=None, control_port=None, use_controller=True,
+                 lan=False, web_port=None, discovery_port=None):
+        self.lan = lan
+        if lan:
+            cfg = real_config(cfg)
+            use_controller = False
         self.cfg = cfg
         self.logdir = logdir
         self.use_controller = use_controller
@@ -86,14 +107,21 @@ class Monitor:
 
         os.makedirs(logdir, exist_ok=True)
 
-        self.report_sock = self.alert_sock = self.ctrl_sock = None
+        self.app_blocked = {}        # LAN mode: ip -> time the monitor stops ignoring it
+        self.recent_alerts = deque(maxlen=50)
+        self.report_sock = self.alert_sock = self.ctrl_sock = self.disc_sock = None
+        self.web = None
         try:
             self.report_sock = self.open_socket(bind_ip, report_port or cfg["report_port"])
             self.alert_sock = self.open_socket(bind_ip, alert_port or cfg["alert_port"])
             if use_controller:
                 self.ctrl_sock = self.open_socket(bind_ip, control_port or cfg["control_port"])
+            if lan:
+                self.disc_sock = self.open_socket(
+                    bind_ip, discovery_port if discovery_port is not None
+                    else cfg["real"]["discovery_port"])
         except OSError:
-            for sock in (self.report_sock, self.alert_sock):
+            for sock in (self.report_sock, self.alert_sock, self.ctrl_sock):
                 if sock:
                     sock.close()
             raise
@@ -120,7 +148,7 @@ class Monitor:
 
     def open_socket(self, ip, port):
         # no SO_REUSEADDR: for UDP it would let two monitors share a port by mistake
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s = udp_socket()
         # a bigger receive buffer so bursts from many agents don't get dropped
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
@@ -132,7 +160,7 @@ class Monitor:
             s.close()
             if e.errno == errno.EADDRINUSE:
                 raise OSError(e.errno, "UDP port %d is already in use. Is another monitor "
-                              "running? (try: sudo mn -c)" % port)
+                              "running? Close it first (Mininet: sudo mn -c)" % port)
             raise
         s.settimeout(0.5)   # so threads can notice when we stop
         return s
@@ -144,7 +172,10 @@ class Monitor:
     def event(self, text):
         line = "%s  %s" % (time.strftime("%H:%M:%S"), text)
         if not self.quiet:
-            print(line, flush=True)
+            try:
+                print(line, flush=True)
+            except UnicodeEncodeError:
+                print(line.encode("ascii", "replace").decode(), flush=True)
         with self.lock:
             self.events.append(line)
             self.events = self.events[-12:]
@@ -169,6 +200,8 @@ class Monitor:
                     time.sleep(0.1)
                 continue
             self.count_packet(addr[0])
+            if self.is_app_blocked(addr[0]):
+                continue
             msg = read_msg(data)
             if msg is None or msg["type"] != REPORT or not valid_report(msg):
                 self.bad_packets += 1
@@ -211,9 +244,23 @@ class Monitor:
             node.ip = addr[0]
             node.received += 1
             node.stats = {k: msg[k] for k in METRICS}
+            info = {k: msg[k] for k in INFO_NUMBERS
+                    if is_number(msg.get(k)) and msg[k] >= 0}
+            if isinstance(msg.get("plugged"), bool):
+                info["plugged"] = msg["plugged"]
+            if isinstance(msg.get("os"), str):
+                info["os"] = msg["os"][:30]
+            top = msg.get("top")
+            if isinstance(top, list):
+                info["top"] = [[str(t[0])[:24], t[1]] for t in top[:3]
+                               if isinstance(t, list) and len(t) == 2 and is_number(t[1])]
+            node.info = info
+            node.history.append([round(now, 1), msg["cpu"], msg["mem"], msg["net_kbps"]])
 
             # the monitor checks the limits itself too, it does not only trust the agent
-            levels = [check_level(node.stats[m], lim) for m, lim in self.cfg["limits"].items()]
+            values = dict(info, **node.stats)
+            levels = [check_level(values[m], lim) for m, lim in self.cfg["limits"].items()
+                      if is_number(values.get(m))]
             node.level = worst_level(levels)
 
             if node.status != "UP":
@@ -246,7 +293,16 @@ class Monitor:
                     time.sleep(0.1)
                 continue
             self.count_packet(addr[0])
+            if self.is_app_blocked(addr[0]):
+                continue
             msg = read_msg(data)
+            if msg is not None and msg["type"] == PING:
+                # an agent measuring its round trip time: just answer
+                try:
+                    self.alert_sock.sendto(make_msg(ACK, MONITOR_NAME, msg["seq"]), addr)
+                except OSError:
+                    pass
+                continue
             if msg is None or msg["type"] != ALERT or not valid_alert(msg):
                 self.bad_packets += 1
                 continue
@@ -280,12 +336,21 @@ class Monitor:
 
         if msg["level"] == "OK":
             text = "CLEAR %s %s back to normal (%s)" % (msg["node"], msg["metric"], msg["value"])
+        elif self.lan:
+            # different laptops have different clocks, so a one-way delay would be
+            # wrong. The real network delay is the RTT column on the dashboard.
+            text = "ALERT %s %s %s = %s (limit %s)" % (
+                msg["level"], msg["node"], msg["metric"], msg["value"], msg["limit"])
         else:
             text = "ALERT %s %s %s = %s (limit %s)  latency %.1f ms" % (
                 msg["level"], msg["node"], msg["metric"], msg["value"], msg["limit"], latency_ms)
             if msg.get("tries", 1) > 1:
                 text += "  [arrived on try %d]" % msg["tries"]
         self.event(text)
+        with self.lock:
+            self.recent_alerts.append({"time": now, "node": msg["node"], "metric": msg["metric"],
+                                       "value": msg["value"], "level": msg["level"],
+                                       "tries": msg.get("tries", 1)})
         self.write_alert(["%.3f" % now, msg["node"], "ALERT", msg["metric"],
                                  msg["value"], msg["level"], "%.3f" % latency_ms,
                                  msg.get("tries", 1)])
@@ -404,8 +469,12 @@ class Monitor:
                         gone.append((node.name, node.ip, quiet))
             for name, ip, quiet in gone:
                 self.event("DOWN  %s - no message for %.1f s" % (name, quiet))
+                with self.lock:
+                    self.recent_alerts.append({"time": now, "node": name, "metric": "silence",
+                                               "value": round(quiet, 1), "level": "DOWN",
+                                               "tries": 1})
                 self.write_alert(["%.3f" % now, name, "DOWN", "silence",
-                                         "%.3f" % quiet, "CRIT", "", ""])
+                                  "%.3f" % quiet, "CRIT", "", ""])
                 self.tell_controller(NODE_DOWN, name, ip)
             self.check_flood(now)
             if self.use_controller:
@@ -433,11 +502,108 @@ class Monitor:
                     self.block_asked[ip] = now
                     flooders.append((ip, self.name_of(ip), rate))
         for ip, name, rate in flooders:
-            self.event("FLOOD %s (%s) sends %.0f packets/s (limit %s), asking to block it"
-                       % (name, ip, rate, self.cfg["flood_pps"]))
             self.write_alert(["%.3f" % now, name, "FLOOD", "pps", "%.0f" % rate,
                               "CRIT", "", ""])
-            self.tell_controller(BLOCK, name, ip, seconds=self.cfg["block_seconds"])
+            if self.use_controller:
+                self.event("FLOOD %s (%s) sends %.0f packets/s (limit %s), asking to block it"
+                           % (name, ip, rate, self.cfg["flood_pps"]))
+                self.tell_controller(BLOCK, name, ip, seconds=self.cfg["block_seconds"])
+            else:
+                # no SDN controller on a real LAN: the monitor ignores that IP itself
+                self.event("FLOOD %s (%s) sends %.0f packets/s (limit %s), ignoring it for %s s"
+                           % (name, ip, rate, self.cfg["flood_pps"], self.cfg["block_seconds"]))
+                with self.lock:
+                    self.app_blocked[ip] = now + self.cfg["block_seconds"]
+                    self.blocked[ip] = name
+
+    def is_app_blocked(self, ip):
+        until = self.app_blocked.get(ip)
+        if until is None:
+            return False
+        if time.time() < until:
+            return True
+        with self.lock:
+            self.app_blocked.pop(ip, None)
+            self.blocked.pop(ip, None)
+            self.block_asked.pop(ip, None)
+        self.event("UNBLOCK %s - the monitor listens to it again" % ip)
+        return False
+
+    # ---------------- port 5002: discovery (LAN mode) ----------------
+
+    def discovery_loop(self):
+        while self.running:
+            try:
+                data, addr = self.disc_sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.running:
+                    time.sleep(0.1)
+                continue
+            msg = read_msg(data)
+            if msg is None or msg["type"] != DISCOVER:
+                self.bad_packets += 1
+                continue
+            try:
+                self.disc_sock.sendto(make_msg(
+                    I_AM_MONITOR, MONITOR_NAME, msg["seq"],
+                    report_port=self.report_sock.getsockname()[1],
+                    alert_port=self.alert_sock.getsockname()[1]), addr)
+            except OSError:
+                pass
+
+    # ---------------- web dashboard (LAN mode) ----------------
+
+    def api_status(self):
+        now = time.time()
+        with self.lock:
+            nodes = []
+            for n in sorted(self.nodes.values(), key=lambda n: n.name):
+                total = n.received + n.lost
+                nodes.append({"name": n.name, "ip": n.ip, "status": n.status,
+                              "level": n.level, "stats": n.stats, "info": n.info,
+                              "last_seen": round(now - n.last_seen, 1),
+                              "received": n.received, "lost": n.lost,
+                              "loss_pct": round(100.0 * n.lost / total, 2) if total else 0,
+                              "alerts": n.alerts, "history": list(n.history)})
+            return {"time": now, "uptime": round(now - self.started), "nodes": nodes,
+                    "total_reports": self.total_reports, "total_alerts": self.total_alerts,
+                    "bad_packets": self.bad_packets, "blocked": dict(self.blocked),
+                    "limits": self.cfg["limits"], "down_after": self.cfg["down_after"],
+                    "events": list(self.events), "alerts": list(self.recent_alerts)[::-1]}
+
+    def start_web(self, port, bind_ip="0.0.0.0"):
+        mon = self
+        page_path = os.path.join(HERE, "dashboard.html")
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    if self.path.split("?")[0] == "/api/status":
+                        body, ctype = json.dumps(mon.api_status()).encode(), "application/json"
+                    elif self.path in ("/", "/index.html"):
+                        with open(page_path, "rb") as f:
+                            body, ctype = f.read(), "text/html; charset=utf-8"
+                    else:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (OSError, ValueError):
+                    pass      # browser closed the tab, etc.
+
+            def log_message(self, *args):
+                pass          # keep the console clean
+
+        http.server.ThreadingHTTPServer.daemon_threads = True
+        self.web = http.server.ThreadingHTTPServer((bind_ip, port), Handler)
+        threading.Thread(target=self.web.serve_forever, daemon=True).start()
+        return self.web.server_address[1]
 
     def write_screen(self):
         now = time.time()
@@ -447,14 +613,14 @@ class Monitor:
             lines.append("HEALTH MONITOR   %s   controller mode: %s   running %d s" % (
                 time.strftime("%H:%M:%S"), self.ctrl_mode, now - self.started))
             lines.append("")
-            lines.append("%-6s %-7s %-6s %6s %6s %6s %10s %10s %6s %7s" % (
+            lines.append("%-16s %-7s %-6s %6s %6s %6s %10s %10s %6s %7s" % (
                 "NODE", "STATUS", "LEVEL", "CPU%", "MEM%", "PROCS", "NET(kbps)",
                 "LAST SEEN", "LOST", "ALERTS"))
-            lines.append("-" * 82)
+            lines.append("-" * 92)
             status = {}
             for n in nodes:
                 s = n.stats
-                lines.append("%-6s %-7s %-6s %6s %6s %6s %10s %9.1fs %6d %7d" % (
+                lines.append("%-16s %-7s %-6s %6s %6s %6s %10s %9.1fs %6d %7d" % (
                     n.name, n.status, n.level if n.status == "UP" else "-",
                     s.get("cpu", "-"), s.get("mem", "-"), s.get("procs", "-"),
                     s.get("net_kbps", "-"), now - n.last_seen, n.lost, n.alerts))
@@ -487,6 +653,8 @@ class Monitor:
         loops = [self.report_loop, self.alert_loop, self.check_loop]
         if self.use_controller:
             loops.append(self.ctrl_loop)
+        if self.disc_sock:
+            loops.append(self.discovery_loop)
         threads = [threading.Thread(target=f, daemon=True) for f in loops]
         for t in threads:
             t.start()
@@ -499,7 +667,10 @@ class Monitor:
             self.running = False
             for t in threads:
                 t.join(timeout=2)
-            for sock in (self.report_sock, self.alert_sock, self.ctrl_sock):
+            if self.web:
+                self.web.shutdown()
+                self.web.server_close()
+            for sock in (self.report_sock, self.alert_sock, self.ctrl_sock, self.disc_sock):
                 if sock:
                     sock.close()
             self.report_file.close()
@@ -510,9 +681,12 @@ class Monitor:
 def write_file(path, text):
     # write to a temp file first, then rename, so readers never see half a file
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        pass      # Windows: the file is open in another program. Try again next time.
 
 
 def main():
@@ -524,12 +698,17 @@ def main():
     p.add_argument("--alert-port", type=int, default=None)
     p.add_argument("--no-controller", action="store_true",
                    help="run without the SDN controller (for testing on one PC)")
+    p.add_argument("--lan", action="store_true",
+                   help="real laptops on a LAN / Wi-Fi: no controller, discovery + web dashboard")
+    p.add_argument("--web-port", type=int, default=None, help="dashboard port (default 8080)")
+    p.add_argument("--table", action="store_true",
+                   help="also show a live table in this terminal (redrawn every second)")
     args = p.parse_args()
 
     try:
         cfg = load_config(args.config)
         mon = Monitor(cfg, args.logdir, args.bind, args.report_port, args.alert_port,
-                      use_controller=not args.no_controller)
+                      use_controller=not (args.no_controller or args.lan), lan=args.lan)
     except ConfigError as e:
         print("ERROR: %s" % e, file=sys.stderr)
         sys.exit(2)
@@ -541,7 +720,43 @@ def main():
         mon.running = False
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+
+    if args.lan:
+        web_port = args.web_port or cfg["real"]["web_port"]
+        try:
+            mon.start_web(web_port, args.bind)
+        except OSError as e:
+            print("WARNING: dashboard not started, TCP port %d: %s (use --web-port 8081)"
+                  % (web_port, e))
+        ips = local_ips() or ["<this laptop's IP>"]
+        print("=" * 64)
+        print(" HEALTH MONITOR (LAN mode)")
+        print(" This laptop's IP address(es): %s" % ", ".join(ips))
+        print(" On each client laptop run:   python agent.py --monitor %s" % ips[0])
+        if mon.web:
+            print(" Live dashboard:              http://%s:%d" % (ips[0], web_port))
+            print("                              (or http://localhost:%d here)" % web_port)
+        print(" Press Ctrl+C to stop.")
+        print("=" * 64, flush=True)
+    if args.table:
+        threading.Thread(target=show_table, args=(mon,), daemon=True).start()
     mon.run()
+
+
+def show_table(mon):
+    """Redraw logs/screen.txt in the terminal every second (works in Windows Terminal too)."""
+    if os.name == "nt":
+        os.system("")          # turns on ANSI colours/cursor codes in the Windows console
+    mon.quiet = True
+    path = os.path.join(mon.logdir, "screen.txt")
+    while mon.running:
+        time.sleep(1)
+        try:
+            with open(path) as f:
+                text = f.read()
+            print("\033[2J\033[H" + text, end="", flush=True)
+        except (OSError, UnicodeEncodeError):
+            pass
 
 
 if __name__ == "__main__":

@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-# Health agent. Runs on every server (h1 .. h4).
+# Health agent. Runs on every client laptop (real mode) or on every Mininet
+# host h1 .. h4 (--sim mode).
+#
+# Real mode (default): reads the REAL CPU, memory, processes, network, disk,
+# temperature and battery of this computer with psutil (see metrics.py).
+# Sim mode (--sim, used by topo.py in Mininet): all Mininet hosts share one
+# PC, so their CPU/memory would be identical. There each agent simulates its
+# own server (FakeServer below).
 #
 # Every second it sends a REPORT to the monitor on UDP port 5000.
 # When a value crosses a limit it also sends an ALERT to UDP port 5001.
@@ -9,8 +16,14 @@
 # The agent does NOT mark its own packets as urgent. In smart mode the SDN
 # controller does that in the switch, so a host can't cheat.
 #
-# Usage:  python3 agent.py --name h1
-#         python3 agent.py --name h3 --flood 300 --seconds 20   (bad host test)
+# In real mode the agent also sends a small PING to the alert port every
+# 5 seconds. The monitor answers with an ACK, so we measure the real round
+# trip time (RTT) over the LAN and put it in the next REPORT.
+#
+# Usage (real laptop):  python agent.py --monitor 192.168.1.20
+#                       python agent.py                 (find the monitor by broadcast)
+# Usage (Mininet):      python3 agent.py --sim --name h1
+#                       python3 agent.py --sim --name h3 --flood 300 --seconds 20
 
 import argparse
 import json
@@ -20,15 +33,23 @@ import random
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 
-from common import (load_config, make_msg, read_msg, check_level, ConfigError,
-                    REPORT, ALERT, ACK, FLOOD)
+from common import (load_config, real_config, make_msg, read_msg, check_level, is_number,
+                    clean_name, udp_socket, ConfigError, METRICS,
+                    REPORT, ALERT, ACK, FLOOD, PING, DISCOVER, I_AM_MONITOR)
 
-STATE_DIR = "/tmp/hmon"   # topo.py writes "spike" commands here
+# topo.py writes "spike" commands here (Mininet). On Windows use the temp folder.
+STATE_DIR = "/tmp/hmon" if os.name == "posix" else os.path.join(tempfile.gettempdir(), "hmon")
 MODES = ("normal", "cpu", "mem", "procs")
 MAX_WAITING_ALERTS = 50   # if the monitor is gone, don't keep alerts forever
+PING_EVERY = 5.0          # real mode: measure the RTT to the monitor this often
+
+# extra fields a real REPORT carries besides cpu / mem / procs / net_kbps
+EXTRA_FIELDS = ("up_kbps", "down_kbps", "disk", "swap", "temp_c", "battery", "plugged",
+                "uptime_h", "cores", "mem_gb", "os", "top")
 
 
 class FakeServer:
@@ -102,12 +123,17 @@ class FakeServer:
 
 
 class Agent:
-    def __init__(self, name, cfg, monitor_ip, report_port, alert_port):
+    def __init__(self, name, cfg, monitor_ip, report_port, alert_port, real=False):
         self.name = name
         self.cfg = cfg
+        self.real = real
         self.report_addr = (monitor_ip, report_port)
         self.alert_addr = (monitor_ip, alert_port)
-        self.server = FakeServer(name)
+        if real:
+            from metrics import RealMachine
+            self.server = RealMachine()
+        else:
+            self.server = FakeServer(name)
         # reports and alerts have their own counters, so the monitor can
         # find lost reports by looking for gaps
         self.report_seq = 0
@@ -118,8 +144,15 @@ class Agent:
         self.running = True
 
         # socket for normal reports, and a separate one for alerts + ACKs
-        self.report_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.alert_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.report_sock = udp_socket()
+        self.alert_sock = udp_socket()
+        self.sock_lock = threading.Lock()   # alerts and pings share alert_sock
+
+        self.rtt_ms = None        # last measured round trip time to the monitor
+        self.last_ping = 0
+        self.pings_sent = 0
+        self.pings_answered = 0
+        self.last_error_log = 0
 
         self.sent_reports = 0
         self.made_alerts = 0      # alerts we wanted to send
@@ -133,18 +166,36 @@ class Agent:
     def send_report(self):
         stats = self.server.read()
         self.report_seq += 1
-        data = make_msg(REPORT, self.name, self.report_seq, boot=self.boot, **stats)
+        fields = {k: stats[k] for k in METRICS}
+        fields.update({k: stats[k] for k in EXTRA_FIELDS if k in stats})
+        if self.real:
+            fields["rtt_ms"] = self.rtt_ms
+        try:
+            data = make_msg(REPORT, self.name, self.report_seq, boot=self.boot, **fields)
+        except ValueError:
+            # too big for one packet (very long process names?): leave the extras out
+            data = make_msg(REPORT, self.name, self.report_seq, boot=self.boot,
+                            **{k: stats[k] for k in METRICS})
         try:
             self.report_sock.sendto(data, self.report_addr)
             self.sent_reports += 1
         except OSError as e:
-            # network down, cable cut ... just try again next second
-            log(self.name, "could not send report: %s" % e)
+            # Wi-Fi dropped, cable cut ... just try again next second
+            self.log_error("could not send report: %s" % e)
         self.check_limits(stats)
+
+    def log_error(self, text):
+        # when the network is gone this would repeat every second, so at most every 10 s
+        now = time.time()
+        if now - self.last_error_log >= 10:
+            self.last_error_log = now
+            log(self.name, text)
 
     def check_limits(self, stats):
         """Send an alert when a metric changes level (OK -> WARN -> CRIT, or back to OK)."""
         for metric, limit in self.cfg["limits"].items():
+            if not is_number(stats.get(metric)):
+                continue      # this computer can't measure it (e.g. no temperature sensor)
             level = check_level(stats[metric], limit)
             old = self.levels.get(metric, "OK")
             if level != old:
@@ -178,8 +229,32 @@ class Agent:
             try:
                 alert = self.alert_queue.get(timeout=0.5)
             except queue.Empty:
+                if self.real and time.time() - self.last_ping >= PING_EVERY:
+                    self.ping()
                 continue
             self.send_alert(alert)
+
+    def ping(self):
+        """Send one PING to the alert port and time the ACK (real round trip time)."""
+        self.last_ping = time.time()
+        self.alert_seq += 1
+        seq = self.alert_seq
+        self.pings_sent += 1
+        start = time.time()
+        try:
+            with self.sock_lock:
+                self.alert_sock.sendto(make_msg(PING, self.name, seq, boot=self.boot),
+                                       self.alert_addr)
+        except OSError as e:
+            self.log_error("could not send ping: %s" % e)
+            self.rtt_ms = None
+            return None
+        if self.wait_for_ack(seq, 1.0):
+            self.pings_answered += 1
+            self.rtt_ms = round((time.time() - start) * 1000, 2)
+        else:
+            self.rtt_ms = None
+        return self.rtt_ms
 
     def send_alert(self, alert):
         self.alert_seq += 1
@@ -194,15 +269,18 @@ class Agent:
             data = make_msg(ALERT, self.name, seq, boot=self.boot, tries=attempt,
                             first_sent=first_sent, **alert)
             self.tries_total += 1
+            sent_at = time.time()
             try:
-                self.alert_sock.sendto(data, self.alert_addr)
+                with self.sock_lock:
+                    self.alert_sock.sendto(data, self.alert_addr)
             except OSError as e:
-                log(self.name, "could not send alert: %s" % e)
+                self.log_error("could not send alert: %s" % e)
 
             if self.wait_for_ack(seq, wait):
                 self.sent_alerts += 1
-                log(self.name, "ALERT %s %s=%s acked (try %d)"
-                    % (alert["level"], alert["metric"], alert["value"], attempt))
+                log(self.name, "ALERT %s %s=%s acked in %.1f ms (try %d)"
+                    % (alert["level"], alert["metric"], alert["value"],
+                       (time.time() - sent_at) * 1000, attempt))
                 return True
             wait *= 2   # wait longer each time
 
@@ -222,7 +300,7 @@ class Agent:
                 data, _ = self.alert_sock.recvfrom(2048)
             except socket.timeout:
                 return False
-            except ConnectionRefusedError:
+            except (ConnectionRefusedError, ConnectionResetError):
                 # "port unreachable" from the monitor host: keep waiting
                 continue
             except OSError:
@@ -235,10 +313,13 @@ class Agent:
     # ---------------- main loop ----------------
 
     def run(self, count=0):
+        log(self.name, "started (%s data), sending to %s:%d (alerts to port %d)"
+            % ("REAL" if self.real else "simulated", self.report_addr[0],
+               self.report_addr[1], self.alert_addr[1]))
+        if self.real:
+            self.first_check()
         t = threading.Thread(target=self.alert_worker, daemon=True)
         t.start()
-        log(self.name, "started, sending to %s:%d (alerts to port %d)"
-            % (self.report_addr[0], self.report_addr[1], self.alert_addr[1]))
 
         every = self.cfg["report_every"]
         next_time = time.time()
@@ -269,6 +350,18 @@ class Agent:
         log(self.name, "stopped. reports=%d alerts=%d failed_alerts=%d"
             % (self.sent_reports, self.sent_alerts, self.failed_alerts))
 
+    def first_check(self):
+        """Real mode: ping the monitor once at the start and say clearly if it answers."""
+        for _ in range(3):
+            if self.ping() is not None:
+                log(self.name, "monitor %s answered, round trip %.1f ms. Sending reports..."
+                    % (self.alert_addr[0], self.rtt_ms))
+                return True
+        log(self.name, "WARNING: no answer from the monitor at %s:%d. Reports are sent "
+            "anyway. Check: is monitor.py --lan running? right IP? firewall on the "
+            "monitor laptop open (guide.md)? same Wi-Fi?" % self.alert_addr)
+        return False
+
     def save_stats(self):
         """Write our counters to /tmp/hmon/<name>.stats (the experiments read it)."""
         stats = {"node": self.name, "time": time.time(), "boot": self.boot,
@@ -286,7 +379,7 @@ class Agent:
 
 def flood(name, monitor_ip, port, pps, seconds):
     """Bad host test: send far too many packets to the monitor."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = udp_socket()
     pad = "x" * 900
     gap = 1.0 / pps
     end = time.time() + seconds
@@ -309,20 +402,77 @@ def flood(name, monitor_ip, port, pps, seconds):
     log(name, "flood finished, %d packets sent" % sent)
 
 
+def broadcast_addresses():
+    """255.255.255.255 plus the broadcast address of every network card."""
+    addrs = ["255.255.255.255"]
+    try:
+        import psutil
+        for nics in psutil.net_if_addrs().values():
+            for a in nics:
+                if a.family == socket.AF_INET and a.broadcast and \
+                        not a.address.startswith("127.") and a.broadcast not in addrs:
+                    addrs.append(a.broadcast)
+    except Exception:       # psutil missing or no permission: the first one is enough
+        pass
+    return addrs
+
+
+def discover_monitor(name, cfg, timeout=2.0, targets=None):
+    """Find the monitor on the LAN: broadcast DISCOVER on UDP port 5002, the
+    monitor answers I_AM_MONITOR. Returns (ip, report_port, alert_port) or None."""
+    port = cfg["real"]["discovery_port"]
+    sock = udp_socket()
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        data = make_msg(DISCOVER, name, 1)
+        for addr in targets or broadcast_addresses():
+            try:
+                sock.sendto(data, (addr, port))
+            except OSError:
+                pass
+        end = time.time() + timeout
+        while time.time() < end:
+            sock.settimeout(max(end - time.time(), 0.01))
+            try:
+                reply, src = sock.recvfrom(2048)
+            except socket.timeout:
+                break
+            except OSError:
+                continue
+            msg = read_msg(reply)
+            if msg and msg["type"] == I_AM_MONITOR:
+                rp, ap = msg.get("report_port"), msg.get("alert_port")
+                if isinstance(rp, int) and isinstance(ap, int):
+                    return src[0], rp, ap
+    finally:
+        sock.close()
+    return None
+
+
 QUIET = False
 
 
 def log(name, text):
     if QUIET:
         return
-    print("[%s] [agent %s] %s" % (time.strftime("%H:%M:%S"), name, text), flush=True)
+    line = "[%s] [agent %s] %s" % (time.strftime("%H:%M:%S"), name, text)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:      # old Windows console
+        print(line.encode("ascii", "replace").decode(), flush=True)
 
 
 def main():
-    p = argparse.ArgumentParser(description="UDP health agent")
-    p.add_argument("--name", required=True, help="name of this server, e.g. h1")
+    p = argparse.ArgumentParser(
+        description="UDP health agent. Real laptop: python agent.py --monitor <monitor IP>")
+    p.add_argument("--name", default=None,
+                   help="name of this computer (default: its hostname; h1.. in Mininet)")
+    p.add_argument("--monitor", default=None,
+                   help='monitor IP, or "auto" to find it by broadcast '
+                        '(default: from config.json)')
+    p.add_argument("--sim", action="store_true",
+                   help="Mininet mode: simulated CPU/memory instead of this computer's real ones")
     p.add_argument("--config", default=None)
-    p.add_argument("--monitor", default=None, help="monitor IP (default from config)")
     p.add_argument("--report-port", type=int, default=None)
     p.add_argument("--alert-port", type=int, default=None)
     p.add_argument("--count", type=int, default=0, help="stop after N reports (0 = forever)")
@@ -340,19 +490,63 @@ def main():
         print("ERROR: --count, --flood and --seconds can't be negative", file=sys.stderr)
         sys.exit(2)
 
-    monitor_ip = args.monitor or cfg["monitor_ip"]
+    real = not args.sim
+    name = clean_name(args.name or (socket.gethostname() if real else ""))
+    if args.sim and not args.name:
+        print("ERROR: --sim needs --name (h1, h2 ...)", file=sys.stderr)
+        sys.exit(2)
+    if real:
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            print("ERROR: psutil is not installed. Run:\n    %s -m pip install psutil"
+                  % sys.executable, file=sys.stderr)
+            sys.exit(2)
+        cfg = real_config(cfg)
+
+    report_port = args.report_port or cfg["report_port"]
+    alert_port = args.alert_port or cfg["alert_port"]
+    monitor_ip = args.monitor or (cfg["real"]["monitor_ip"] if real else cfg["monitor_ip"])
+
+    stopping = []
+    if monitor_ip == "auto":
+        log(name, "looking for the monitor on the LAN (broadcast to UDP port %d) ..."
+            % cfg["real"]["discovery_port"])
+        found = None
+        try:
+            while found is None:
+                found = discover_monitor(name, cfg)
+                if found is None:
+                    log(name, "no monitor answered yet. Is monitor.py --lan running? "
+                        "(Or start me with --monitor <IP>.) Trying again ...")
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            return
+        monitor_ip = found[0]
+        if not args.report_port and not args.alert_port:
+            report_port, alert_port = found[1], found[2]
+        log(name, "found the monitor at %s" % monitor_ip)
+    else:
+        try:
+            socket.inet_aton(monitor_ip)
+        except OSError:
+            print("ERROR: --monitor must be an IP address like 192.168.1.20, not %r"
+                  % monitor_ip, file=sys.stderr)
+            sys.exit(2)
+
     if args.flood:
-        flood(args.name, monitor_ip, args.report_port or cfg["report_port"],
-              args.flood, args.seconds)
+        flood(name, monitor_ip, report_port, args.flood, args.seconds)
         return
 
-    agent = Agent(args.name, cfg,
-                  monitor_ip,
-                  args.report_port or cfg["report_port"],
-                  args.alert_port or cfg["alert_port"])
+    try:
+        agent = Agent(name, cfg, monitor_ip, report_port, alert_port, real=real)
+    except RuntimeError as e:
+        print("ERROR: %s" % e, file=sys.stderr)
+        sys.exit(2)
 
     def stop(*_):
         agent.running = False
+        stopping.append(1)
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 

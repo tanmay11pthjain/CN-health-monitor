@@ -1,9 +1,13 @@
 # Small helpers used by agent.py, monitor.py, controller.py and the tests.
+# Works on Windows, Linux and macOS (only the standard library is used here).
 
+import copy
 import ipaddress
 import json
 import math
 import os
+import re
+import socket
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,8 +27,16 @@ BLOCK = "BLOCK"
 CTRL_REPLY = "CTRL_REPLY"
 NET_EVENT = "NET_EVENT"
 FLOOD = "FLOOD"
+PING = "PING"              # agent -> monitor on the alert port, answered with an ACK
+DISCOVER = "DISCOVER"      # agent broadcast: "where is the monitor?"
+I_AM_MONITOR = "I_AM_MONITOR"   # monitor's answer to DISCOVER
 
+# every REPORT must have these four numbers
 METRICS = ("cpu", "mem", "procs", "net_kbps")
+# limits (and alerts) may also use these. A real laptop sends them when it can
+# read them (no temperature sensor on most Windows laptops, for example).
+EXTRA_METRICS = ("disk", "temp_c")
+ALERT_METRICS = METRICS + EXTRA_METRICS
 LEVELS = ("OK", "WARN", "CRIT")
 
 # Values used when config.json does not have them (so an old config still works).
@@ -46,6 +58,20 @@ DEFAULTS = {
     "slow_above_mbps": 4.0,   # a host sending more than this is slowed down ...
     "slow_rate_mbps": 1.0,    # ... to this speed
     "calm_below_mbps": 0.5,   # limit is removed when the host stays under this
+    # Real laptops on a LAN / Wi-Fi (agent.py without --sim, monitor.py --lan)
+    "real": {
+        "monitor_ip": "auto",     # "auto" = find the monitor with a broadcast
+        "discovery_port": 5002,
+        "web_port": 8080,
+        "limits": {
+            "cpu":      {"warn": 75,    "crit": 90},
+            "mem":      {"warn": 80,    "crit": 90},
+            "procs":    {"warn": 450,   "crit": 600},
+            "net_kbps": {"warn": 20000, "crit": 50000},
+            "disk":     {"warn": 90,    "crit": 97},
+            "temp_c":   {"warn": 80,    "crit": 90},
+        },
+    },
 }
 
 
@@ -67,10 +93,21 @@ def load_config(path=None):
         raise ConfigError("%s is not valid JSON: %s" % (path, e))
     if not isinstance(raw, dict):
         raise ConfigError("%s must contain one JSON object { ... }" % path)
-    cfg = dict(DEFAULTS)
+    cfg = copy.deepcopy(DEFAULTS)
+    real = raw.get("real")
     cfg.update(raw)
+    if isinstance(real, dict):
+        # fill in missing keys of the "real" part too
+        cfg["real"] = dict(DEFAULTS["real"], **real)
     check_config(cfg)
     return cfg
+
+
+def real_config(cfg):
+    """The config used for real laptops: same as cfg, but with the "real" limits."""
+    out = dict(cfg)
+    out["limits"] = cfg["real"]["limits"]
+    return out
 
 
 def check_config(cfg):
@@ -108,20 +145,43 @@ def check_config(cfg):
     if cfg["mode"] not in ("simple", "smart"):
         fail('mode must be "simple" or "smart", not %r' % (cfg["mode"],))
 
-    limits = cfg.get("limits")
+    check_limits(cfg.get("limits"), "limits", fail)
+
+    real = cfg.get("real")
+    if not isinstance(real, dict):
+        fail('"real" must look like {"monitor_ip": "auto", "web_port": 8080, ...}')
+    ip = real.get("monitor_ip")
+    if ip != "auto":
+        try:
+            ipaddress.IPv4Address(ip)
+        except (ValueError, TypeError):
+            fail('real.monitor_ip must be "auto" or an IPv4 address like 192.168.1.20, not %r'
+                 % (ip,))
+    for key in ("discovery_port", "web_port"):
+        v = real.get(key)
+        if not is_int(v) or not 1 <= v <= 65535:
+            fail("real.%s must be a whole number from 1 to 65535, not %r" % (key, v))
+    if real["discovery_port"] in (cfg["report_port"], cfg["alert_port"]):
+        fail("real.discovery_port must be different from report_port and alert_port")
+    check_limits(real.get("limits"), "real.limits", fail)
+
+
+def check_limits(limits, where, fail):
     if not isinstance(limits, dict):
-        fail("limits is missing")
+        fail("%s is missing" % where)
+    for metric in limits:
+        if metric not in ALERT_METRICS:
+            fail("%s.%s is unknown (use %s)" % (where, metric, ", ".join(ALERT_METRICS)))
     for metric in METRICS:
-        lim = limits.get(metric)
+        if metric not in limits:
+            fail('%s.%s is missing' % (where, metric))
+    for metric, lim in limits.items():
         if not isinstance(lim, dict) or not is_number(lim.get("warn")) \
                 or not is_number(lim.get("crit")):
-            fail('limits.%s must look like {"warn": 75, "crit": 90}' % metric)
+            fail('%s.%s must look like {"warn": 75, "crit": 90}' % (where, metric))
         if lim["warn"] >= lim["crit"]:
-            fail("limits.%s: warn (%s) must be smaller than crit (%s)"
-                 % (metric, lim["warn"], lim["crit"]))
-    for metric in limits:
-        if metric not in METRICS:
-            fail("limits.%s is unknown (use %s)" % (metric, ", ".join(METRICS)))
+            fail("%s.%s: warn (%s) must be smaller than crit (%s)"
+                 % (where, metric, lim["warn"], lim["crit"]))
 
 
 def is_int(v):
@@ -176,7 +236,7 @@ def valid_report(msg):
 
 def valid_alert(msg):
     """True if an ALERT has everything the monitor needs."""
-    return (msg.get("metric") in METRICS and msg.get("level") in LEVELS
+    return (msg.get("metric") in ALERT_METRICS and msg.get("level") in LEVELS
             and is_number(msg.get("value")) and is_number(msg.get("limit"))
             and is_number(msg.get("first_sent", msg["time"]))
             and is_int(msg.get("tries", 1)))
@@ -197,3 +257,47 @@ def worst_level(levels):
     if "WARN" in levels:
         return "WARN"
     return "OK"
+
+
+def clean_name(text):
+    """Turn a computer name into a safe node name: letters, digits, - _ . only."""
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(text)).strip("-.")
+    return name[:MAX_NAME] or "node"
+
+
+def udp_socket():
+    """A UDP socket that behaves the same on Windows, Linux and macOS."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Windows only: when we send to a port nobody listens on, Windows makes the
+    # NEXT recvfrom() fail with "connection reset" (error 10054). For UDP that
+    # makes no sense, so switch it off.
+    if hasattr(socket, "SIO_UDP_CONNRESET"):
+        try:
+            s.ioctl(socket.SIO_UDP_CONNRESET, False)
+        except (OSError, ValueError):
+            pass
+    return s
+
+
+def local_ips():
+    """IPv4 addresses of this computer that other laptops can reach (best guess)."""
+    ips = []
+    # the address used to reach the internet / the router (no packet is sent)
+    for target in ("8.8.8.8", "192.168.0.1", "10.255.255.255"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((target, 80))
+            ip = s.getsockname()[0]
+            if ip not in ips and not ip.startswith(("127.", "0.")):
+                ips.append(ip)
+        except OSError:
+            pass
+        finally:
+            s.close()
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip not in ips and not ip.startswith(("127.", "169.254.")):
+                ips.append(ip)
+    except OSError:
+        pass
+    return ips

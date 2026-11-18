@@ -190,7 +190,7 @@ class Run:
         return total
 
     def agent_running(self, name):
-        out = self.net.get(name).cmd("pgrep -f 'agent.py --name %s$'" % name)
+        out = self.net.get(name).cmd("pgrep -f 'agent.py --sim --name %s$'" % name)
         return out.strip() != ""
 
     def cpu_seconds(self):

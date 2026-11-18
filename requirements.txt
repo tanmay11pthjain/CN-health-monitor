@@ -1,2 +1,4 @@
-# Only the SDN controller needs these. agent.py and monitor.py use plain Python.
+# Only the SDN controller (Mininet mode) needs os-ken.
+# Real laptops only need psutil:  pip install psutil
+psutil>=5.9
 os-ken==3.1.1

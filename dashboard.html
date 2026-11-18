@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Health Monitor</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a2129; --line:#2a333d; --text:#e6e9ec; --dim:#8b96a1;
+          --ok:#2fbf71; --warn:#f0b429; --crit:#ef4e4e; --cpu:#4aa8ff; --mem:#b583ff; --net:#3fd0c9; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap;
+           gap:8px 24px; align-items:baseline; }
+  h1 { font-size:18px; margin:0; }
+  .dim { color:var(--dim); }
+  main { padding:16px 20px; display:grid; gap:16px; }
+  .nodes { display:grid; gap:16px; grid-template-columns:repeat(auto-fill, minmax(340px, 1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .card.DOWN { border-color:var(--crit); opacity:.75; }
+  .top { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .name { font-size:16px; font-weight:600; word-break:break-all; }
+  .badge { padding:2px 8px; border-radius:99px; font-size:12px; font-weight:600; color:#111; }
+  .b-OK { background:var(--ok); } .b-WARN { background:var(--warn); }
+  .b-CRIT, .b-DOWN { background:var(--crit); color:#fff; }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin:2px 0 8px; }
+  .bar > div { height:100%; border-radius:4px; }
+  .row { display:flex; justify-content:space-between; font-size:13px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:4px 16px; margin-top:6px; font-size:13px; }
+  canvas { width:100%; height:70px; display:block; margin-top:8px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td, th { text-align:left; padding:4px 6px; border-bottom:1px solid var(--line); }
+  .legend span { margin-right:10px; font-size:12px; }
+  .empty { color:var(--dim); padding:30px; text-align:center; }
+  #conn { font-weight:600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Remote System Health Monitor</h1>
+  <span class="dim">real laptops over UDP</span>
+  <span id="summary" class="dim"></span>
+  <span id="conn"></span>
+</header>
+<main>
+  <div id="nodes" class="nodes"><div class="empty">Waiting for agents...</div></div>
+  <div class="card"><b>Alerts</b><table id="alerts"></table></div>
+  <div class="card"><b>Events</b><div id="events" class="dim" style="font-family:monospace;white-space:pre-wrap;font-size:12px"></div></div>
+</main>
+<script>
+"use strict";
+const COLORS = {OK:"var(--ok)", WARN:"var(--warn)", CRIT:"var(--crit)"};
+let limits = {};
+
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const k in attrs || {}) { if (k === "class") e.className = attrs[k]; else e.setAttribute(k, attrs[k]); }
+  for (const c of kids) e.append(c instanceof Node ? c : document.createTextNode(c));
+  return e;
+}
+function level(metric, v) {
+  const l = limits[metric];
+  if (!l || v == null) return "OK";
+  return v >= l.crit ? "CRIT" : v >= l.warn ? "WARN" : "OK";
+}
+function fmt(v, unit, digits) { return v == null ? "n/a" : Number(v).toFixed(digits ?? 1) + (unit || ""); }
+function rate(kbps) { return kbps == null ? "n/a" : kbps >= 1000 ? (kbps/1000).toFixed(2) + " Mbps" : kbps.toFixed(0) + " kbps"; }
+
+function bar(label, metric, v) {
+  const lv = level(metric, v);
+  const inner = el("div"); inner.style.width = Math.min(v || 0, 100) + "%"; inner.style.background = COLORS[lv];
+  return [el("div", {class:"row"}, el("span", {}, label), el("span", {}, fmt(v, "%"))), el("div", {class:"bar"}, inner)];
+}
+
+function draw(canvas, hist) {
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const c = canvas.getContext("2d"); c.scale(dpr, dpr);
+  c.strokeStyle = "#2a333d"; c.beginPath(); c.moveTo(0, h - .5); c.lineTo(w, h - .5); c.stroke();
+  if (hist.length < 2) return;
+  const t0 = hist[hist.length - 1][0] - 120;
+  const maxNet = Math.max(1, ...hist.map(p => p[3]));
+  const line = (idx, color, scale) => {
+    c.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue(color); c.lineWidth = 1.5; c.beginPath();
+    hist.forEach((p, i) => { const x = (p[0] - t0) / 120 * w, y = h - 2 - (p[idx] / scale) * (h - 4);
+      i ? c.lineTo(x, y) : c.moveTo(x, y); });
+    c.stroke();
+  };
+  line(3, "--net", maxNet); line(2, "--mem", 100); line(1, "--cpu", 100);
+}
+
+function card(n) {
+  const s = n.stats || {}, i = n.info || {};
+  const status = n.status === "UP" ? n.level : "DOWN";
+  const cv = el("canvas");
+  const top = (i.top || []).map(t => t[0] + " " + t[1] + "%").join(", ") || "n/a";
+  const batt = i.battery == null ? "no battery" : fmt(i.battery, "%", 0) + (i.plugged ? " (charging)" : " (on battery)");
+  const box = el("div", {class:"card " + n.status},
+    el("div", {class:"top"}, el("span", {class:"name"}, n.name), el("span", {class:"badge b-" + status}, status)),
+    el("div", {class:"dim"}, n.ip + "  |  " + (i.os || "") + (i.cores ? "  |  " + i.cores + " cores, " + i.mem_gb + " GB" : "")),
+    el("div", {style:"margin-top:8px"}, ...bar("CPU", "cpu", s.cpu), ...bar("Memory", "mem", s.mem), ...bar("Disk", "disk", i.disk)),
+    el("div", {class:"grid"},
+      el("span", {}, "Processes: " + (s.procs ?? "n/a")),
+      el("span", {}, "Temp: " + fmt(i.temp_c, " C")),
+      el("span", {}, "Upload: " + rate(i.up_kbps)),
+      el("span", {}, "Download: " + rate(i.down_kbps)),
+      el("span", {}, "RTT: " + fmt(i.rtt_ms, " ms", 1)),
+      el("span", {}, "Lost: " + n.lost + " (" + n.loss_pct + "%)"),
+      el("span", {}, "Battery: " + batt),
+      el("span", {}, "Swap: " + fmt(i.swap, "%")),
+      el("span", {}, "Last seen: " + n.last_seen + " s ago"),
+      el("span", {}, "Uptime: " + fmt(i.uptime_h, " h")),
+    ),
+    el("div", {class:"dim", style:"margin-top:6px;font-size:12px"}, "Top CPU: " + top),
+    cv,
+    el("div", {class:"legend dim"}, el("span", {style:"color:var(--cpu)"}, "CPU"),
+       el("span", {style:"color:var(--mem)"}, "Memory"), el("span", {style:"color:var(--net)"}, "Network (scaled)"),
+       el("span", {}, "last 2 min")));
+  return [box, () => draw(cv, n.history || [])];
+}
+
+async function tick() {
+  let d;
+  try {
+    const r = await fetch("/api/status", {cache: "no-store"});
+    d = await r.json();
+    document.getElementById("conn").textContent = "";
+  } catch (e) {
+    document.getElementById("conn").textContent = "monitor not reachable, retrying...";
+    document.getElementById("conn").style.color = "var(--crit)";
+    return;
+  }
+  limits = d.limits || {};
+  const up = d.nodes.filter(n => n.status === "UP").length;
+  document.getElementById("summary").textContent =
+    `${up}/${d.nodes.length} nodes up  |  reports ${d.total_reports}  |  alerts ${d.total_alerts}  |  bad packets ${d.bad_packets}  |  running ${d.uptime}s` +
+    (Object.keys(d.blocked).length ? "  |  ignoring (flood): " + Object.keys(d.blocked).join(", ") : "");
+  const box = document.getElementById("nodes");
+  box.replaceChildren();
+  if (!d.nodes.length) box.append(el("div", {class:"empty"}, "Waiting for agents... start agent.py on the client laptops."));
+  const draws = [];
+  for (const n of d.nodes) { const [c, f] = card(n); box.append(c); draws.push(f); }
+  draws.forEach(f => f());
+  const t = document.getElementById("alerts");
+  t.replaceChildren(el("tr", {}, el("th", {}, "Time"), el("th", {}, "Node"), el("th", {}, "Metric"),
+                       el("th", {}, "Value"), el("th", {}, "Level"), el("th", {}, "Try")));
+  for (const a of d.alerts.slice(0, 15)) {
+    const lv = el("span", {class:"badge b-" + a.level}, a.level);
+    t.append(el("tr", {}, el("td", {}, new Date(a.time * 1000).toLocaleTimeString()), el("td", {}, a.node),
+      el("td", {}, a.metric), el("td", {}, String(a.value)), el("td", {}, lv), el("td", {}, String(a.tries))));
+  }
+  if (!d.alerts.length) t.append(el("tr", {}, el("td", {class:"dim"}, "No alerts yet")));
+  document.getElementById("events").textContent = d.events.slice().reverse().join("\n");
+}
+tick(); setInterval(tick, 1000);
+</script>
+</body>
+</html>

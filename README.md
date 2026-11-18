@@ -4,10 +4,25 @@ Computer Networks mini project: SDN-Socket Programming.
 
 Servers send their health (CPU, memory, processes, network) every second over **UDP** to one central monitor. The monitor shows a live table, raises alerts when a value crosses a limit, and marks a server DOWN when it stops talking. The network is built in **Mininet** and controlled by an **SDN controller** (os-ken, OpenFlow 1.3). The controller gives alert packets a fast lane and talks to the monitor over UDP.
 
+- **NEW: real deployment on 3 laptops with real hardware data: [LAN_SETUP.md](LAN_SETUP.md)**
 - How to run it step by step: [guide.md](guide.md)
 - Full plan and rubric checklist: [PLAN.md](PLAN.md)
 
 Status: **Phase 1 (D1) and Phase 2 (D2) done.** Smart controller (priority, traffic watching, slowing down, blocking, recovery), hard situations (traffic jam, packet loss, cut cable, server crash, flooding, monitor restart), and experiments comparing simple mode with smart mode. Results are below.
+
+## Two ways to run it
+
+| | Real laptops (LAN mode) | Mininet + SDN (simulation) |
+|---|---|---|
+| Data | REAL: psutil reads CPU, memory, processes, network up/down, disk, swap, temperature, battery, top processes | simulated CPU/mem/procs (all Mininet hosts share one PC), real network |
+| Monitor | `python monitor.py --lan` (+ web dashboard on :8080, discovery on UDP 5002) | `python3 monitor.py` (talks to the SDN controller) |
+| Agent | `python agent.py --monitor <IP>` | started by `topo.py` as `agent.py --sim --name h1` |
+| Blocking a flooder | done by the monitor itself (ignores that IP for 30 s) | done in the switch by the SDN controller |
+| OS | Windows, Linux, macOS | Ubuntu |
+
+New in LAN mode: `metrics.py` (real readings), `dashboard.html` (live web page), `stress.py` (real CPU/memory load for the demo), `firewall_windows.bat`. The UDP protocol, sequence numbers, ACK + retry with backoff, DOWN after 3 s and packet checks are the same in both modes.
+
+![dashboard](results/lan_dashboard.png)
 
 ---
 

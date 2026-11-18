@@ -152,11 +152,11 @@ def stop_monitor(net):
 
 def start_agent(net, name, logdir=LOGS):
     h = net.get(name)
-    h.cmd("%s %s/agent.py --name %s >> %s/agent_%s.txt 2>&1 &" % (PY, HERE, name, logdir, name))
+    h.cmd("%s %s/agent.py --sim --name %s >> %s/agent_%s.txt 2>&1 &" % (PY, HERE, name, logdir, name))
 
 
 def stop_agent(net, name):
-    net.get(name).cmd("pkill -f 'agent.py --name %s$'" % name)
+    net.get(name).cmd("pkill -f 'agent.py --sim --name %s$'" % name)
 
 
 def congest(net, on, mbps=JAM_MBPS, seconds=3600):
@@ -169,13 +169,13 @@ def congest(net, on, mbps=JAM_MBPS, seconds=3600):
 
 def flood(net, name, pps=FLOOD_PPS, seconds=20, logdir=LOGS):
     h = net.get(name)
-    h.cmd("pkill -f 'agent.py --name %s --flood'" % name)
-    h.cmd("%s %s/agent.py --name %s --flood %d --seconds %d >> %s/agent_%s.txt 2>&1 &"
+    h.cmd("pkill -f 'agent.py --sim --name %s --flood'" % name)
+    h.cmd("%s %s/agent.py --sim --name %s --flood %d --seconds %d >> %s/agent_%s.txt 2>&1 &"
           % (PY, HERE, name, pps, seconds, logdir, name))
 
 
 def stop_flood(net, name):
-    net.get(name).cmd("pkill -f 'agent.py --name %s --flood'" % name)
+    net.get(name).cmd("pkill -f 'agent.py --sim --name %s --flood'" % name)
 
 
 def set_loss(net, percent, agents):
